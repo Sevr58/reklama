@@ -148,8 +148,21 @@ def polish_draft(draft_text: str) -> str:
     return message.content[0].text
 
 
+IMAGE_STYLE_GUIDE = """Visual style rules (follow strictly):
+- Color palette: cream #F8F5F0, dark forest green #1C3A28, gold #C9A84C, warm beige #EDEAE3
+- Mood: elegant, minimal, sophisticated — NOT dark, NOT moody
+- Either hyperrealistic photography OR clean geometric abstract composition
+- No text, no words, no logos, no watermarks
+- No human faces
+- Square format 1:1
+- Examples of visual directions:
+  * Hyperrealistic: a single expensive object (leather notebook, vintage camera, film reel) on cream linen surface, natural side lighting, editorial photography
+  * Geometric: precise overlapping circles and rectangles in forest green and gold on cream background, architectural minimalism
+  * Abstract: flowing geometric shapes suggesting movement or strategy, green-gold-cream palette, premium feel
+- The image must feel like it belongs on a luxury brand's Instagram feed"""
+
 def generate_image_prompt(topic: dict, post_text: str) -> str:
-    """Генерирует промпт для DALL-E на основе поста."""
+    """Генерирует промпт для Imagen 4 на основе поста."""
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -157,14 +170,14 @@ def generate_image_prompt(topic: dict, post_text: str) -> str:
         messages=[
             {
                 "role": "user",
-                "content": f"""На основе этого поста и стиля изображения придумай короткий промпт для DALL-E (на английском, 1-2 предложения).
+                "content": f"""Create a short image generation prompt in English (2-3 sentences) for this post.
 
-Стиль изображения: {topic['image_style']}
+{IMAGE_STYLE_GUIDE}
 
-Текст поста:
-{post_text[:300]}
+Post theme (use for visual concept only):
+{post_text[:200]}
 
-Ответь только промптом, без пояснений."""
+Reply with the prompt only, no explanations."""
             }
         ]
     )

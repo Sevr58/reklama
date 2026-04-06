@@ -21,13 +21,16 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 def generate_video_prompt(post_text: str) -> str:
     """Создаёт промпт для видео на основе текста поста."""
-    # Берём первые 200 символов текста как основу для промпта
-    short = post_text[:200].replace("\n", " ").strip()
+    short = post_text[:150].replace("\n", " ").strip()
     return (
-        f"Cinematic vertical video for social media. Dark moody professional atmosphere. "
-        f"Theme: {short}. "
-        f"No text on screen. Smooth camera movement. 4K quality. "
-        f"Business and marketing aesthetics. Black background with dramatic lighting."
+        f"Elegant vertical video for premium social media. "
+        f"Color palette: cream white, forest green #1C3A28, gold #C9A84C. "
+        f"Style: either hyperrealistic product/object cinematography OR smooth geometric animation with minimal shapes. "
+        f"Concept inspired by: {short}. "
+        f"No text on screen. No faces. No voice. No sound needed. "
+        f"Slow smooth camera movement or gentle geometric motion. "
+        f"Luxury brand aesthetic, editorial quality, 4K. "
+        f"Feel: sophisticated, confident, minimal — like a premium fashion or architecture brand reel."
     )
 
 
