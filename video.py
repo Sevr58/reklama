@@ -70,7 +70,9 @@ def generate_video(post_text: str, output_filename: str = "reel.mp4") -> str:
         raise RuntimeError("Veo 3: видео не сгенерировано")
 
     video = operation.response.generated_videos[0]
-    client.files.download(file=video.video, download_path=str(output_path))
+    video_bytes = client.files.download(file=video.video)
+    with open(output_path, "wb") as f:
+        f.write(video_bytes)
 
     log.info(f"[Veo3] Видео сохранено: {output_path}")
     return str(output_path)

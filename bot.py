@@ -11,12 +11,16 @@ Telegram-бот Севрюгин.
   /publish — опубликовать черновики
   /myid    — показать твой Telegram ID
   /ideas   — запустить исследование вручную прямо сейчас
+  /restart — перезапустить бота (сбросить зависший режим)
 """
 
+import os
 import re
+import sys
 import json
 import logging
 import asyncio
+import threading
 from pathlib import Path
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -229,7 +233,7 @@ async def handle_idea_selection(update: Update, context: ContextTypes.DEFAULT_TY
         "name": "Из исследования",
         "description": "",
         "prompt_hint": "",
-        "image_style": "dark cinematic professional advertising photography, moody lighting"
+        "image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"
     }
 
     for idea in selected:
@@ -272,7 +276,7 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from content import generate_image_prompt
             from images import generate_image
-            draft_topic = {"image_style": "dark cinematic professional advertising photography"}
+            draft_topic = {"image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"}
             image_prompt = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: generate_image_prompt(draft_topic, final_text)
             )
@@ -298,6 +302,18 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(caption, parse_mode="Markdown")
 
 
+def _build_progress(results: dict, current: str = "") -> str:
+    lines = []
+    for label, (icon, detail) in results.items():
+        line = f"{icon} {label}"
+        if detail:
+            line += f" — {detail[:80]}" if len(detail) > 80 else f" — {detail}"
+        lines.append(line)
+    if current:
+        lines.append(current)
+    return "\n".join(lines) if lines else "🚀 Публикую..."
+
+
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает одобрение/отклонение поста."""
     text = update.message.text.strip().lower()
@@ -311,17 +327,42 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview_image = post.get("preview_image")
 
     if text in ("ок", "ok", "окей", "давай", "публикуй", "да"):
-        # Публикуем с уже готовой картинкой
-        await update.message.reply_text("🚀 Публикую...")
-        try:
-            report = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _publish_approved_post(final_text, preview_image)
-            )
-            await update.message.reply_text(f"Опубликовано:\n{report}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+        status_msg = await update.message.reply_text("🚀 Публикую...")
 
-        # Запускаем генерацию видео в фоне
+        results = {}  # label -> (ok, detail)
+
+        async def step(emoji: str, label: str, fn):
+            await status_msg.edit_text(_build_progress(results, f"{emoji} {label}..."))
+            try:
+                detail = await asyncio.get_event_loop().run_in_executor(None, fn)
+                results[label] = ("✅", str(detail) if detail else "")
+            except Exception as e:
+                results[label] = ("❌", str(e))
+            await status_msg.edit_text(_build_progress(results))
+
+        from poster import post_telegram, post_social
+        from content import adapt_for_platform
+        from images import cleanup_image
+
+        await step("📤", "Telegram",   lambda: post_telegram(final_text, preview_image))
+        await step("📸", "Instagram",  lambda: post_social(adapt_for_platform(final_text, "instagram"), preview_image, ["instagram"]))
+        await step("👥", "Facebook",   lambda: post_social(adapt_for_platform(final_text, "facebook"), preview_image, ["facebook"]))
+        await step("🐦", "X",          lambda: post_social(adapt_for_platform(final_text, "x"), preview_image, ["x"]))
+
+        await status_msg.edit_text(_build_progress(results, "📝 Блог (генерирую статью ~30 сек)..."))
+        try:
+            from blog_publisher import publish_to_blog
+            blog_url = await asyncio.get_event_loop().run_in_executor(None, lambda: publish_to_blog(final_text))
+            results["Блог"] = ("✅", blog_url)
+        except Exception as e:
+            results["Блог"] = ("❌", str(e))
+        await status_msg.edit_text(_build_progress(results))
+
+        if preview_image:
+            cleanup_image(preview_image)
+
+        results["Видео"] = ("🎬", "генерирую в фоне (~2 мин)...")
+        await status_msg.edit_text(_build_progress(results))
         _publish_video_post(final_text, update.effective_chat.id, context.application)
 
         state["current_post_index"] = idx + 1
@@ -354,36 +395,6 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_next_post(update, context)
 
 
-def _publish_approved_post(text: str, image_path: str = None) -> str:
-    """Публикует текст+картинку в Telegram, X, Facebook, Instagram, блог. Возвращает отчёт."""
-    from poster import post_telegram, post_social
-    from content import adapt_for_platform
-    from images import cleanup_image
-
-    results = ["✅ Telegram"]
-    post_telegram(text, image_path)
-
-    for platform in ["instagram", "facebook", "x"]:
-        try:
-            post_social(adapt_for_platform(text, platform), image_path, [platform])
-            results.append(f"✅ {platform.upper() if platform == 'x' else platform.capitalize()}")
-        except Exception as e:
-            results.append(f"❌ {platform.upper() if platform == 'x' else platform.capitalize()}: {e}")
-            log.warning(f"[{platform}] Ошибка: {e}")
-
-    if image_path:
-        cleanup_image(image_path)
-
-    # Публикуем в блог
-    try:
-        from blog_publisher import publish_to_blog
-        blog_url = publish_to_blog(text)
-        results.append(f"✅ Блог: {blog_url}")
-    except Exception as e:
-        results.append(f"❌ Блог: {e}")
-        log.warning(f"[Blog] Ошибка: {e}")
-
-    return "\n".join(results)
 
 
 def _publish_video_post(text: str, chat_id: int, app):
@@ -467,10 +478,15 @@ async def cmd_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         await update.message.reply_text("Нет новых черновиков.")
         return
-    await update.message.reply_text(f"🚀 Публикую {len(pending)} черновиков...")
+    await update.message.reply_text(
+        f"🎨 Генерирую {len(pending)} пост(ов) из черновиков — пришлю на согласование..."
+    )
+    # Сохраняем chat_id чтобы main.py мог прислать превью
+    state = load_state()
+    state["owner_chat_id"] = update.effective_chat.id
+    save_state(state)
     try:
         await asyncio.get_event_loop().run_in_executor(None, publish_draft)
-        await update.message.reply_text("✅ Готово!")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -479,15 +495,47 @@ async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_daily_ideas(context.application, update.effective_chat.id)
 
 
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перезапустить бота — сбрасывает зависшие режимы и стартует заново."""
+    state = load_state()
+    # Разрешаем только владельцу
+    owner = state.get("owner_chat_id")
+    if owner and update.effective_chat.id != owner:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    state["mode"] = "idle"
+    save_state(state)
+    await update.message.reply_text("🔄 Перезапускаю бота...")
+
+    def _do_restart():
+        import time
+        time.sleep(1.5)
+        subprocess_args = [sys.executable] + sys.argv
+        import subprocess
+        subprocess.Popen(subprocess_args)
+        os._exit(0)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main():
+    # Сбрасываем зависший режим при каждом запуске
+    state = load_state()
+    if state.get("mode") not in ("idle", None):
+        log.info(f"Сбрасываю зависший mode='{state['mode']}' → idle")
+        state["mode"] = "idle"
+        save_state(state)
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("publish", cmd_publish))
     app.add_handler(CommandHandler("ideas", cmd_ideas))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
