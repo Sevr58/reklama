@@ -1,0 +1,8 @@
+anthropic
+openai
+python-telegram-bot
+python-dotenv
+apscheduler
+requests
+yt-dlp
+feedparser

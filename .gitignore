@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.ogg
+bot_state.json
+draft.txt
+*.png
+*.jpg
+*.jpeg
+.claude/
