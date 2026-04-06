@@ -278,6 +278,9 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
+        # Запускаем генерацию видео в фоне
+        _publish_video_post(final_text, update.effective_chat.id, context.application)
+
         state["current_post_index"] = idx + 1
         save_state(state)
         await show_next_post(update, context)
@@ -309,7 +312,7 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _publish_approved_post(text: str) -> str:
-    """Синхронная публикация одобренного поста. Возвращает отчёт."""
+    """Публикует текст+картинку в Telegram, X, Facebook, Instagram. Возвращает отчёт."""
     from poster import post_telegram, post_social
     from content import adapt_for_platform
     from images import generate_image, cleanup_image
@@ -325,21 +328,47 @@ def _publish_approved_post(text: str) -> str:
         log.warning(f"Изображение не сгенерировано: {e}")
 
     results = ["✅ Telegram"]
-
     post_telegram(text, image_path)
 
-    for platform in ["instagram", "facebook"]:
+    for platform in ["instagram", "facebook", "x"]:
         try:
             post_social(adapt_for_platform(text, platform), image_path, [platform])
-            results.append(f"✅ {platform.capitalize()}")
+            results.append(f"✅ {platform.upper() if platform == 'x' else platform.capitalize()}")
         except Exception as e:
-            results.append(f"❌ {platform.capitalize()}: {e}")
+            results.append(f"❌ {platform.upper() if platform == 'x' else platform.capitalize()}: {e}")
             log.warning(f"[{platform}] Ошибка: {e}")
 
     if image_path:
         cleanup_image(image_path)
 
     return "\n".join(results)
+
+
+def _publish_video_post(text: str, chat_id: int, app):
+    """Генерирует видео через Veo 3 и публикует в YouTube Shorts + Instagram Reels."""
+    import threading
+    from poster import post_video
+    from video import generate_video, cleanup_video
+
+    def run():
+        asyncio.run(_notify(chat_id, app, "🎬 Генерирую видео для Shorts/Reels..."))
+        video_path = None
+        try:
+            video_path = generate_video(text)
+            post_video(text, video_path, ["youtube", "instagram"])
+            asyncio.run(_notify(chat_id, app, "✅ YouTube Shorts + Instagram Reels опубликованы!"))
+        except Exception as e:
+            log.warning(f"[Video] Ошибка: {e}")
+            asyncio.run(_notify(chat_id, app, f"❌ Видео не опубликовано: {e}"))
+        finally:
+            if video_path:
+                cleanup_video(video_path)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+async def _notify(chat_id: int, app, text: str):
+    await app.bot.send_message(chat_id=chat_id, text=text)
 
 
 # ─── Команды ──────────────────────────────────────────────────────────────────
