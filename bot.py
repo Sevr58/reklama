@@ -106,14 +106,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
 
-    # Проверяем — не в режиме ли выбора идей
     state = load_state()
+
+    # Одобрение/отклонение видео
+    if state.get("pending_video"):
+        if text.lower() in ("публикую видео", "видео ок", "публикуй видео", "да видео"):
+            await handle_video_approval(update, context)
+            return
+        if text.lower() in ("пропустить видео", "удали видео", "нет видео", "skip video"):
+            from video import cleanup_video
+            cleanup_video(state["pending_video"])
+            state.pop("pending_video", None)
+            state.pop("pending_video_text", None)
+            save_state(state)
+            await update.message.reply_text("🗑 Видео удалено.")
+            return
+
     if state.get("mode") == "selecting_ideas":
         await handle_idea_selection(update, context)
         return
     if state.get("mode") == "approving_post":
         await handle_approval(update, context)
         return
+
+    # Сохраняем chat_id владельца для main.py
+    state["owner_chat_id"] = update.effective_chat.id
+    save_state(state)
 
     number = _append_draft(text)
     await update.message.reply_text(
@@ -232,7 +250,7 @@ async def handle_idea_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает следующий пост на одобрение."""
+    """Показывает следующий пост + картинку на согласование."""
     state = load_state()
     posts = state.get("pending_posts", [])
     idx = state.get("current_post_index", 0)
@@ -247,13 +265,37 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signature = "Напиши мне → @Nzamba\nsevrugin.pro"
     final_text = f"{post['post_text']}\n\n{signature}"
 
-    await update.message.reply_text(
+    # Используем уже готовую картинку или генерируем новую
+    image_path = post.get("preview_image")
+    if not image_path:
+        await update.message.reply_text("🎨 Генерирую картинку для превью...")
+        try:
+            from content import generate_image_prompt
+            from images import generate_image
+            draft_topic = {"image_style": "dark cinematic professional advertising photography"}
+            image_prompt = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: generate_image_prompt(draft_topic, final_text)
+            )
+            image_path = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: generate_image(image_prompt)
+            )
+            posts[idx]["preview_image"] = image_path
+            state["pending_posts"] = posts
+            save_state(state)
+        except Exception as e:
+            log.warning(f"Превью картинки: {e}")
+
+    caption = (
         f"📝 *Пост {idx+1}/{len(posts)}* — {post['idea']}\n\n{final_text}\n\n"
         f"Напиши *ок* — опубликую\n"
         f"Напиши *пропустить* — следующий\n"
-        f"Или напиши правки — переделаю",
-        parse_mode="Markdown"
+        f"Или напиши правки — переделаю"
     )
+
+    if image_path:
+        with open(image_path, "rb") as photo:
+            await update.message.reply_photo(photo=photo)
+    await update.message.reply_text(caption, parse_mode="Markdown")
 
 
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,13 +308,14 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     signature = "Напиши мне → @Nzamba\nsevrugin.pro"
     final_text = f"{post['post_text']}\n\n{signature}"
+    preview_image = post.get("preview_image")
 
     if text in ("ок", "ok", "окей", "давай", "публикуй", "да"):
-        # Публикуем
+        # Публикуем с уже готовой картинкой
         await update.message.reply_text("🚀 Публикую...")
         try:
             report = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _publish_approved_post(final_text)
+                None, lambda: _publish_approved_post(final_text, preview_image)
             )
             await update.message.reply_text(f"Опубликовано:\n{report}")
         except Exception as e:
@@ -311,21 +354,11 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_next_post(update, context)
 
 
-def _publish_approved_post(text: str) -> str:
-    """Публикует текст+картинку в Telegram, X, Facebook, Instagram. Возвращает отчёт."""
+def _publish_approved_post(text: str, image_path: str = None) -> str:
+    """Публикует текст+картинку в Telegram, X, Facebook, Instagram, блог. Возвращает отчёт."""
     from poster import post_telegram, post_social
     from content import adapt_for_platform
-    from images import generate_image, cleanup_image
-    from content import generate_image_prompt
-
-    draft_topic = {"image_style": "dark cinematic professional advertising photography"}
-
-    image_path = None
-    try:
-        image_prompt = generate_image_prompt(draft_topic, text)
-        image_path = generate_image(image_prompt)
-    except Exception as e:
-        log.warning(f"Изображение не сгенерировано: {e}")
+    from images import cleanup_image
 
     results = ["✅ Telegram"]
     post_telegram(text, image_path)
@@ -341,30 +374,74 @@ def _publish_approved_post(text: str) -> str:
     if image_path:
         cleanup_image(image_path)
 
+    # Публикуем в блог
+    try:
+        from blog_publisher import publish_to_blog
+        blog_url = publish_to_blog(text)
+        results.append(f"✅ Блог: {blog_url}")
+    except Exception as e:
+        results.append(f"❌ Блог: {e}")
+        log.warning(f"[Blog] Ошибка: {e}")
+
     return "\n".join(results)
 
 
 def _publish_video_post(text: str, chat_id: int, app):
-    """Генерирует видео через Veo 3 и публикует в YouTube Shorts + Instagram Reels."""
+    """Генерирует видео через Veo 3, присылает в Telegram на согласование."""
     import threading
-    from poster import post_video
     from video import generate_video, cleanup_video
 
     def run():
-        asyncio.run(_notify(chat_id, app, "🎬 Генерирую видео для Shorts/Reels..."))
+        asyncio.run(_notify(chat_id, app, "🎬 Генерирую видео для Shorts/Reels (~2 мин)..."))
         video_path = None
         try:
             video_path = generate_video(text)
-            post_video(text, video_path, ["youtube", "instagram"])
-            asyncio.run(_notify(chat_id, app, "✅ YouTube Shorts + Instagram Reels опубликованы!"))
+            # Сохраняем путь в состоянии и ждём одобрения
+            state = load_state()
+            state["pending_video"] = video_path
+            state["pending_video_text"] = text
+            save_state(state)
+            # Присылаем видео на согласование
+            asyncio.run(_send_video_preview(chat_id, app, video_path))
         except Exception as e:
-            log.warning(f"[Video] Ошибка: {e}")
-            asyncio.run(_notify(chat_id, app, f"❌ Видео не опубликовано: {e}"))
-        finally:
-            if video_path:
-                cleanup_video(video_path)
+            log.warning(f"[Video] Ошибка генерации: {e}")
+            asyncio.run(_notify(chat_id, app, f"❌ Видео не сгенерировано: {e}"))
 
     threading.Thread(target=run, daemon=True).start()
+
+
+async def handle_video_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Публикует одобренное видео в YouTube Shorts + Instagram Reels."""
+    state = load_state()
+    video_path = state.get("pending_video")
+    text = state.get("pending_video_text", "")
+
+    if not video_path:
+        await update.message.reply_text("Нет ожидающего видео.")
+        return
+
+    await update.message.reply_text("🚀 Публикую видео в Shorts/Reels...")
+    try:
+        from poster import post_video
+        from video import cleanup_video
+        post_video(text, video_path, ["youtube", "instagram"])
+        cleanup_video(video_path)
+        state.pop("pending_video", None)
+        state.pop("pending_video_text", None)
+        save_state(state)
+        await update.message.reply_text("✅ YouTube Shorts + Instagram Reels опубликованы!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def _send_video_preview(chat_id: int, app, video_path: str):
+    with open(video_path, "rb") as vid:
+        await app.bot.send_video(
+            chat_id=chat_id,
+            video=vid,
+            caption="🎬 Видео готово. Напиши *публикую видео* — залью в Shorts/Reels, или *пропустить видео* — удалю.",
+            parse_mode="Markdown"
+        )
 
 
 async def _notify(chat_id: int, app, text: str):
@@ -415,7 +492,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     log.info("Бот запущен.")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

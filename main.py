@@ -69,8 +69,65 @@ def _mark_done_in_file(draft_path: str, number: int):
         f.write(updated)
 
 
+def _queue_for_approval(post_text: str, image_path: str, label: str):
+    """Ставит готовый пост в очередь бота на согласование и уведомляет пользователя."""
+    import requests as req
+    from bot import load_state, save_state
+    from config import TELEGRAM_BOT_TOKEN
+
+    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
+    final_text = f"{post_text}\n\n{signature}"
+
+    state = load_state()
+    chat_id = state.get("owner_chat_id")
+
+    pending = state.get("pending_posts", [])
+    pending.append({
+        "idea": label,
+        "post_text": post_text,
+        "preview_image": image_path,
+    })
+    # Не сбрасываем current_post_index если уже идёт одобрение
+    if state.get("mode") != "approving_post":
+        state["current_post_index"] = len(pending) - 1
+    state["pending_posts"] = pending
+    state["mode"] = "approving_post"
+    save_state(state)
+
+    if not chat_id:
+        log.warning("owner_chat_id не задан — пост добавлен в очередь но уведомление не отправлено")
+        return
+
+    # Присылаем картинку
+    if image_path:
+        try:
+            with open(image_path, "rb") as photo:
+                req.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    data={"chat_id": chat_id},
+                    files={"photo": photo},
+                    timeout=30
+                )
+        except Exception as e:
+            log.warning(f"Не удалось отправить картинку: {e}")
+
+    # Присылаем текст на согласование
+    caption = (
+        f"📝 *{label}*\n\n{final_text}\n\n"
+        f"Напиши *ок* — опубликую\n"
+        f"Напиши *пропустить* — следующий\n"
+        f"Или напиши правки — переделаю"
+    )
+    req.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={"chat_id": chat_id, "text": caption, "parse_mode": "Markdown"},
+        timeout=30
+    )
+    log.info(f"Пост отправлен на согласование: {label}")
+
+
 def _publish_single_draft(draft_text: str):
-    """Полирует одну идею и публикует как пост."""
+    """Полирует одну идею → картинка → ставит в очередь на согласование."""
 
     log.info(f"Идея: {draft_text[:80]}...")
     post_text = polish_draft(draft_text)
@@ -86,10 +143,8 @@ def _publish_single_draft(draft_text: str):
     try:
         search_query = extract_ad_reference(post_text, claude_client)
         if search_query:
-            log.info(f"Ищу на YouTube: {search_query}")
             video = find_youtube_video(search_query)
             if video:
-                log.info(f"Найдено: {video['title']}")
                 image_path = download_thumbnail(video)
                 youtube_url = video["url"]
 
@@ -99,40 +154,12 @@ def _publish_single_draft(draft_text: str):
             log.info("AI-изображение готово")
 
     except Exception as e:
-        log.warning(f"Ошибка с медиа: {e}. Публикую без картинки.")
+        log.warning(f"Ошибка с медиа: {e}")
 
-    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
-    final_text = f"{post_text}\n\n{signature}"
     if youtube_url:
-        final_text = f"{post_text}\n\n▶️ {youtube_url}\n\n{signature}"
+        post_text = f"{post_text}\n\n▶️ {youtube_url}"
 
-    post_telegram(final_text, image_path)
-
-    # Instagram — своя версия поста
-    try:
-        instagram_text = adapt_for_platform(final_text, "instagram")
-        post_social(instagram_text, image_path, platforms=["instagram"])
-        log.info("Instagram: опубликовано")
-    except Exception as e:
-        log.warning(f"Instagram: ошибка — {e}")
-
-    # Facebook — своя версия поста
-    try:
-        facebook_text = adapt_for_platform(final_text, "facebook")
-        post_social(facebook_text, image_path, platforms=["facebook"])
-        log.info("Facebook: опубликовано")
-    except Exception as e:
-        log.warning(f"Facebook: ошибка — {e}")
-
-    if image_path:
-        cleanup_image(image_path)
-
-    # Публикуем на сайт
-    try:
-        blog_url = publish_to_blog(post_text)
-        log.info(f"Статья на сайте: {blog_url}")
-    except Exception as e:
-        log.warning(f"Не удалось опубликовать на сайт: {e}")
+    _queue_for_approval(post_text, image_path, "Черновик")
 
 
 def publish_draft(draft_path: str = "draft.txt"):
@@ -218,20 +245,11 @@ def publish_post(topic_id: str = None):
     except Exception as e:
         log.warning(f"Ошибка с медиа: {e}. Публикую без картинки.")
 
-    # Собираем финальный текст
-    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
-    final_text = f"{post_text}\n\n{signature}"
     if youtube_url:
-        final_text = f"{post_text}\n\n▶️ {youtube_url}\n\n{signature}"
+        post_text = f"{post_text}\n\n▶️ {youtube_url}"
 
-    # Публикуем в Telegram
-    post_telegram(final_text, image_path)
-
-    # Удаляем временный файл
-    if image_path:
-        cleanup_image(image_path)
-
-    log.info("Готово!")
+    _queue_for_approval(post_text, image_path, topic["name"])
+    log.info("Пост отправлен на согласование.")
 
 
 def send_ideas_sync():

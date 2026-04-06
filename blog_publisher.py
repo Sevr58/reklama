@@ -99,7 +99,7 @@ def generate_article(post_text: str) -> dict:
 def create_article_html(article: dict, slug: str) -> Path:
     """Создаёт HTML-файл статьи по шаблону."""
 
-    today = datetime.now().strftime("%-d %B %Y").replace(
+    today = datetime.now().strftime("%d %B %Y").lstrip("0").replace(
         "January","января").replace("February","февраля").replace(
         "March","марта").replace("April","апреля").replace(
         "May","мая").replace("June","июня").replace(
