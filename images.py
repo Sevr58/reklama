@@ -1,37 +1,46 @@
-import openai
-import requests
-import os
-from config import OPENAI_API_KEY
+import uuid
+import logging
+from pathlib import Path
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+from google import genai
+from google.genai import types
+
+from config import GEMINI_API_KEY
+
+log = logging.getLogger(__name__)
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL = "imagen-4.0-generate-001"
 
 
-def generate_image(prompt: str, save_path: str = "temp_image.png") -> str:
+def generate_image(prompt: str, save_path: str = None) -> str:
     """
-    Генерирует изображение через DALL-E 3 и сохраняет локально.
+    Генерирует изображение через Google Imagen 4 и сохраняет локально.
     Возвращает путь к файлу.
     """
-    full_prompt = f"{prompt}. Dark, cinematic, professional. No text, no watermarks."
+    if save_path is None:
+        save_path = f"temp_image_{uuid.uuid4().hex[:8]}.png"
 
-    response = client.images.generate(
-        model="dall-e-3",
+    full_prompt = f"{prompt}. Dark cinematic professional advertising photography. No text, no watermarks, no logos."
+
+    response = client.models.generate_images(
+        model=MODEL,
         prompt=full_prompt,
-        size="1024x1024",
-        quality="standard",
-        n=1,
+        config=types.GenerateImagesConfig(
+            number_of_images=1,
+            aspect_ratio="1:1",
+        ),
     )
 
-    image_url = response.data[0].url
-
-    # Скачиваем изображение локально
-    img_response = requests.get(image_url)
+    image_data = response.generated_images[0].image.image_bytes
     with open(save_path, "wb") as f:
-        f.write(img_response.content)
+        f.write(image_data)
 
+    log.info(f"[Imagen4] Изображение сохранено: {save_path}")
     return save_path
 
 
 def cleanup_image(path: str):
-    """Удаляет временный файл изображения."""
-    if os.path.exists(path):
-        os.remove(path)
+    p = Path(path)
+    if p.exists():
+        p.unlink()
