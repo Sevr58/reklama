@@ -19,7 +19,6 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from topics import get_topic_for_today, get_topic_by_id
 from content import generate_post, generate_image_prompt, polish_draft, adapt_for_platform, client as claude_client
-from images import generate_image, cleanup_image
 from poster import post_telegram, post_social
 from media_finder import extract_ad_reference, find_youtube_video, download_thumbnail
 from blog_publisher import publish_to_blog
@@ -133,10 +132,6 @@ def _publish_single_draft(draft_text: str):
     post_text = polish_draft(draft_text)
     log.info(f"Текст готов ({len(post_text)} симв.)")
 
-    draft_topic = {
-        "image_style": "dark cinematic professional advertising photography, moody lighting"
-    }
-
     image_path = None
     youtube_url = None
 
@@ -147,12 +142,6 @@ def _publish_single_draft(draft_text: str):
             if video:
                 image_path = download_thumbnail(video)
                 youtube_url = video["url"]
-
-        if not image_path:
-            image_prompt = generate_image_prompt(draft_topic, post_text)
-            image_path = generate_image(image_prompt)
-            log.info("AI-изображение готово")
-
     except Exception as e:
         log.warning(f"Ошибка с медиа: {e}")
 
@@ -214,36 +203,21 @@ def publish_post(topic_id: str = None):
     post_text = generate_post(topic)
     log.info(f"Текст готов ({len(post_text)} симв.)")
 
-    # Ищем реальный ролик или генерируем AI-картинку
+    # Ищем YouTube-превью (бесплатно). Картинку пользователь сгенерирует вручную в AI Studio.
     image_path = None
     youtube_url = None
 
     try:
-        # Проверяем: упоминает ли пост конкретный реальный ролик?
         search_query = extract_ad_reference(post_text, claude_client)
-
         if search_query:
-            log.info(f"Пост упоминает реальный ролик. Ищу на YouTube: {search_query}")
+            log.info(f"Ищу YouTube-ролик: {search_query}")
             video = find_youtube_video(search_query)
-
             if video:
                 log.info(f"Найдено: {video['title']} → {video['url']}")
                 image_path = download_thumbnail(video)
                 youtube_url = video["url"]
-                if image_path:
-                    log.info("Превью скачано")
-                else:
-                    log.warning("Превью не скачалось, буду генерировать AI-картинку")
-
-        # Если реального ролика нет или не нашли — генерируем AI
-        if not image_path:
-            image_prompt = generate_image_prompt(topic, post_text)
-            log.info(f"Генерирую AI-картинку: {image_prompt[:80]}...")
-            image_path = generate_image(image_prompt)
-            log.info("AI-изображение готово")
-
     except Exception as e:
-        log.warning(f"Ошибка с медиа: {e}. Публикую без картинки.")
+        log.warning(f"Ошибка с медиа: {e}")
 
     if youtube_url:
         post_text = f"{post_text}\n\n▶️ {youtube_url}"

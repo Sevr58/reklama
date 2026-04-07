@@ -17,6 +17,7 @@ Telegram-бот Севрюгин.
 import os
 import re
 import sys
+import uuid
 import json
 import logging
 import asyncio
@@ -112,24 +113,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = load_state()
 
-    # Одобрение/отклонение видео
-    if state.get("pending_video"):
-        if text.lower() in ("публикую видео", "видео ок", "публикуй видео", "да видео"):
-            await handle_video_approval(update, context)
-            return
-        if text.lower() in ("пропустить видео", "удали видео", "нет видео", "skip video"):
-            from video import cleanup_video
-            cleanup_video(state["pending_video"])
-            state.pop("pending_video", None)
-            state.pop("pending_video_text", None)
-            save_state(state)
-            await update.message.reply_text("🗑 Видео удалено.")
-            return
+    mode = state.get("mode")
 
-    if state.get("mode") == "selecting_ideas":
+    # Режим ожидания видео от пользователя
+    if mode == "waiting_for_video":
+        if text.lower() in ("публикую видео", "видео ок", "публикуй видео", "да"):
+            await handle_video_publish(update, context)
+            return
+        if text.lower() in ("пропустить видео", "удали видео", "нет видео", "skip", "пропустить"):
+            v = state.get("pending_video")
+            if v:
+                from video import cleanup_video
+                cleanup_video(v)
+                state.pop("pending_video", None)
+            state.pop("pending_video_text", None)
+            state["mode"] = "idle"
+            save_state(state)
+            await update.message.reply_text("🗑 Видео пропущено.")
+            return
+        await update.message.reply_text(
+            "Отправь видеофайл или напиши *пропустить видео*", parse_mode="Markdown"
+        )
+        return
+
+    # Режим ожидания картинки
+    if mode == "waiting_for_image":
+        await update.message.reply_text(
+            "Отправь картинку (фото), а не текст."
+        )
+        return
+
+    if mode == "selecting_ideas":
         await handle_idea_selection(update, context)
         return
-    if state.get("mode") == "approving_post":
+    if mode == "approving_post":
         await handle_approval(update, context)
         return
 
@@ -254,7 +271,7 @@ async def handle_idea_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает следующий пост + картинку на согласование."""
+    """Показывает следующий пост на согласование."""
     state = load_state()
     posts = state.get("pending_posts", [])
     idx = state.get("current_post_index", 0)
@@ -268,38 +285,106 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = posts[idx]
     signature = "Напиши мне → @Nzamba\nsevrugin.pro"
     final_text = f"{post['post_text']}\n\n{signature}"
-
-    # Используем уже готовую картинку или генерируем новую
     image_path = post.get("preview_image")
-    if not image_path:
-        await update.message.reply_text("🎨 Генерирую картинку для превью...")
-        try:
-            from content import generate_image_prompt
-            from images import generate_image
-            draft_topic = {"image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"}
-            image_prompt = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: generate_image_prompt(draft_topic, final_text)
-            )
-            image_path = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: generate_image(image_prompt)
-            )
-            posts[idx]["preview_image"] = image_path
-            state["pending_posts"] = posts
-            save_state(state)
-        except Exception as e:
-            log.warning(f"Превью картинки: {e}")
 
-    caption = (
-        f"📝 *Пост {idx+1}/{len(posts)}* — {post['idea']}\n\n{final_text}\n\n"
-        f"Напиши *ок* — опубликую\n"
-        f"Напиши *пропустить* — следующий\n"
-        f"Или напиши правки — переделаю"
-    )
-
-    if image_path:
+    if image_path and Path(image_path).exists():
+        # Картинка уже есть (YouTube-превью или загружена вручную) — сразу на согласование
+        state["mode"] = "approving_post"
+        save_state(state)
         with open(image_path, "rb") as photo:
             await update.message.reply_photo(photo=photo)
-    await update.message.reply_text(caption, parse_mode="Markdown")
+        await update.message.reply_text(
+            f"📝 *Пост {idx+1}/{len(posts)}* — {post.get('idea', '')}\n\n{final_text}\n\n"
+            f"*ок* — публикую\n"
+            f"*пропустить* — следующий\n"
+            f"Или напиши правки — переделаю и покажу снова (можно несколько раз)",
+            parse_mode="Markdown"
+        )
+    else:
+        # Нет картинки — просим сгенерировать вручную на AI Studio
+        from content import generate_image_prompt
+        draft_topic = {"image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"}
+        image_prompt = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: generate_image_prompt(draft_topic, final_text)
+        )
+        state["mode"] = "waiting_for_image"
+        state["pending_posts"] = posts
+        save_state(state)
+
+        await update.message.reply_text(
+            f"📝 *Пост {idx+1}/{len(posts)}* — {post.get('idea', '')}\n\n{final_text}",
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            f"🎨 *Промпт для картинки* — вставь в AI Studio:\n\n`{image_prompt}`\n\n"
+            f"[Открыть Google AI Studio](https://aistudio.google.com/generate-image)\n\n"
+            f"Сгенерируй и отправь картинку сюда.",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь прислал картинку (фото или файл-изображение) для поста."""
+    state = load_state()
+
+    if state.get("mode") != "waiting_for_image":
+        await update.message.reply_text("Картинка получена, но сейчас нет активного поста.")
+        return
+
+    try:
+        await update.message.reply_text("💾 Сохраняю...")
+        save_path = str(Path(__file__).parent / f"temp_image_{uuid.uuid4().hex[:8]}.jpg")
+
+        if update.message.photo:
+            # Обычное фото — берём наибольший размер
+            file = await update.message.photo[-1].get_file()
+        else:
+            # Документ (PNG/JPG отправленный как файл)
+            file = await update.message.document.get_file()
+
+        await file.download_to_drive(save_path)
+
+        posts = state.get("pending_posts", [])
+        idx = state.get("current_post_index", 0)
+        posts[idx]["preview_image"] = save_path
+        state["pending_posts"] = posts
+        save_state(state)
+
+        await show_next_post(update, context)
+    except Exception as e:
+        log.exception("Ошибка при обработке фото")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь прислал видео для Shorts/Reels."""
+    state = load_state()
+
+    if state.get("mode") != "waiting_for_video":
+        return
+
+    await update.message.reply_text("💾 Сохраняю видео...")
+
+    if update.message.video:
+        file = await update.message.video.get_file()
+    elif update.message.document:
+        file = await update.message.document.get_file()
+    else:
+        return
+
+    save_path = str(Path(__file__).parent / f"temp_video_{uuid.uuid4().hex[:8]}.mp4")
+    await file.download_to_drive(save_path)
+
+    state["pending_video"] = save_path
+    save_state(state)
+
+    await update.message.reply_text(
+        "🎬 Видео получено!\n\n"
+        "Напиши *публикую видео* — залью в YouTube Shorts + Instagram Reels\n"
+        "Или *пропустить видео* — удалю",
+        parse_mode="Markdown"
+    )
 
 
 def _build_progress(results: dict, current: str = "") -> str:
@@ -361,13 +446,25 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if preview_image:
             cleanup_image(preview_image)
 
-        results["Видео"] = ("🎬", "генерирую в фоне (~2 мин)...")
-        await status_msg.edit_text(_build_progress(results))
-        _publish_video_post(final_text, update.effective_chat.id, context.application)
-
         state["current_post_index"] = idx + 1
+        state["pending_video_text"] = final_text
         save_state(state)
-        await show_next_post(update, context)
+
+        # Отправляем промпт для ручной генерации видео
+        from video import generate_video_prompt
+        video_prompt = generate_video_prompt(final_text)
+        state2 = load_state()
+        state2["mode"] = "waiting_for_video"
+        save_state(state2)
+
+        await update.message.reply_text(
+            f"🎬 *Промпт для видео* — вставь в Veo 3 на AI Studio:\n\n`{video_prompt}`\n\n"
+            f"[Открыть Google AI Studio](https://aistudio.google.com)\n\n"
+            f"Сгенерируй, скачай и отправь видео сюда.\n"
+            f"Или напиши *пропустить видео*.",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
 
     elif text in ("пропустить", "skip", "нет", "не надо"):
         state["current_post_index"] = idx + 1
@@ -375,60 +472,27 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_next_post(update, context)
 
     else:
-        # Если пользователь прислал длинный текст — это его собственный вариант, использовать как есть
-        # Если короткая правка — применить к оригиналу через polish_draft
-        if len(text) > 100:
-            await update.message.reply_text("✅ Беру твой текст как основу.")
-            posts[idx]["post_text"] = text
-            state["pending_posts"] = posts
-            save_state(state)
-            await show_next_post(update, context)
-        else:
-            await update.message.reply_text("✍️ Переделываю...")
-            from content import polish_draft
-            corrected = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: polish_draft(f"{post['post_text']}\n\nПравки: {text}")
-            )
-            posts[idx]["post_text"] = corrected
-            state["pending_posts"] = posts
-            save_state(state)
-            await show_next_post(update, context)
+        await update.message.reply_text("✍️ Переделываю...")
+        from content import polish_draft
+        corrected = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: polish_draft(f"{post['post_text']}\n\nПравки от автора: {update.message.text.strip()}")
+        )
+        posts[idx]["post_text"] = corrected
+        state["pending_posts"] = posts
+        save_state(state)
+        await show_next_post(update, context)
 
 
 
 
-def _publish_video_post(text: str, chat_id: int, app):
-    """Генерирует видео через Veo 3, присылает в Telegram на согласование."""
-    import threading
-    from video import generate_video, cleanup_video
-
-    def run():
-        asyncio.run(_notify(chat_id, app, "🎬 Генерирую видео для Shorts/Reels (~2 мин)..."))
-        video_path = None
-        try:
-            video_path = generate_video(text)
-            # Сохраняем путь в состоянии и ждём одобрения
-            state = load_state()
-            state["pending_video"] = video_path
-            state["pending_video_text"] = text
-            save_state(state)
-            # Присылаем видео на согласование
-            asyncio.run(_send_video_preview(chat_id, app, video_path))
-        except Exception as e:
-            log.warning(f"[Video] Ошибка генерации: {e}")
-            asyncio.run(_notify(chat_id, app, f"❌ Видео не сгенерировано: {e}"))
-
-    threading.Thread(target=run, daemon=True).start()
-
-
-async def handle_video_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Публикует одобренное видео в YouTube Shorts + Instagram Reels."""
+async def handle_video_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Публикует видео, загруженное пользователем, в YouTube Shorts + Instagram Reels."""
     state = load_state()
     video_path = state.get("pending_video")
     text = state.get("pending_video_text", "")
 
-    if not video_path:
-        await update.message.reply_text("Нет ожидающего видео.")
+    if not video_path or not Path(video_path).exists():
+        await update.message.reply_text("Нет загруженного видео. Отправь видеофайл сначала.")
         return
 
     await update.message.reply_text("🚀 Публикую видео в Shorts/Reels...")
@@ -439,24 +503,11 @@ async def handle_video_approval(update: Update, context: ContextTypes.DEFAULT_TY
         cleanup_video(video_path)
         state.pop("pending_video", None)
         state.pop("pending_video_text", None)
+        state["mode"] = "idle"
         save_state(state)
         await update.message.reply_text("✅ YouTube Shorts + Instagram Reels опубликованы!")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def _send_video_preview(chat_id: int, app, video_path: str):
-    with open(video_path, "rb") as vid:
-        await app.bot.send_video(
-            chat_id=chat_id,
-            video=vid,
-            caption="🎬 Видео готово. Напиши *публикую видео* — залью в Shorts/Reels, или *пропустить видео* — удалю.",
-            parse_mode="Markdown"
-        )
-
-
-async def _notify(chat_id: int, app, text: str):
-    await app.bot.send_message(chat_id=chat_id, text=text)
 
 
 # ─── Команды ──────────────────────────────────────────────────────────────────
@@ -521,7 +572,36 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
+LOCK_FILE = Path(__file__).parent / "bot.pid"
+
+def _kill_previous():
+    """Убивает предыдущий процесс бота по PID-файлу."""
+    if not LOCK_FILE.exists():
+        return
+    try:
+        old_pid = int(LOCK_FILE.read_text().strip())
+        if old_pid == os.getpid():
+            return
+        import psutil
+        try:
+            p = psutil.Process(old_pid)
+            p.kill()
+            log.info(f"Убит старый процесс бота PID={old_pid}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    except Exception:
+        pass
+    LOCK_FILE.unlink(missing_ok=True)
+
+
+def _write_pid():
+    LOCK_FILE.write_text(str(os.getpid()))
+
+
 def main():
+    _kill_previous()
+    _write_pid()
+
     # Сбрасываем зависший режим при каждом запуске
     state = load_state()
     if state.get("mode") not in ("idle", None):
@@ -536,6 +616,8 @@ def main():
     app.add_handler(CommandHandler("publish", cmd_publish))
     app.add_handler(CommandHandler("ideas", cmd_ideas))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
