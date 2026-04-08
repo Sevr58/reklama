@@ -258,7 +258,7 @@ def upload_files(files: list[tuple[Path, str]]):
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21, timeout=60)
     ftp.login(FTP_USER, FTP_PASS)
-    ftp.set_pasv(True)
+    ftp.set_pasv(False)
 
     for local_path, remote_path in files:
         with open(local_path, "rb") as f:

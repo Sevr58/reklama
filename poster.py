@@ -119,7 +119,7 @@ def post_video(text: str, video_path: str, platforms: list = None):
 
     with open(video_path, "rb") as vid:
         r = requests.post(
-            "https://api.upload-post.com/api/upload_video",
+            "https://api.upload-post.com/api/upload",
             headers=headers,
             files={"video": vid},
             data=data,
