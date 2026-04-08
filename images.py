@@ -9,8 +9,13 @@ from config import GEMINI_API_KEY
 
 log = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = "imagen-4.0-generate-001"
+
+
+def _get_client():
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY не задан в .env")
+    return genai.Client(api_key=GEMINI_API_KEY)
 
 
 def generate_image(prompt: str, save_path: str = None) -> str:
@@ -29,6 +34,7 @@ def generate_image(prompt: str, save_path: str = None) -> str:
         f"No text, no words, no logos, no watermarks, no human faces. Square 1:1."
     )
 
+    client = _get_client()
     response = client.models.generate_images(
         model=MODEL,
         prompt=full_prompt,
