@@ -69,13 +69,15 @@ def _mark_done_in_file(draft_path: str, number: int):
 
 
 def _queue_for_approval(post_text: str, image_path: str, label: str):
-    """Ставит готовый пост в очередь бота на согласование и уведомляет пользователя."""
+    """Ставит готовый пост в очередь бота на согласование и уведомляет пользователя.
+
+    Не перезаписывает чужие режимы (выбор идей, ожидание медиа, согласование текущего поста).
+    Если пользователь занят — пост просто кладётся в очередь, об этом приходит уведомление,
+    забрать его можно командой /show.
+    """
     import requests as req
     from bot import load_state, save_state
     from config import TELEGRAM_BOT_TOKEN
-
-    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
-    final_text = f"{post_text}\n\n{signature}"
 
     state = load_state()
     chat_id = state.get("owner_chat_id")
@@ -86,18 +88,44 @@ def _queue_for_approval(post_text: str, image_path: str, label: str):
         "post_text": post_text,
         "preview_image": image_path,
     })
-    # Не сбрасываем current_post_index если уже идёт одобрение
-    if state.get("mode") != "approving_post":
-        state["current_post_index"] = len(pending) - 1
     state["pending_posts"] = pending
-    state["mode"] = "approving_post"
+
+    current_mode = state.get("mode")
+    if current_mode in ("approving_post", "waiting_for_image", "waiting_for_video"):
+        # Пользователь уже что-то решает — не перебиваем, просто добавляем в очередь
+        was_busy = True
+    else:
+        # Свободен (idle / selecting_ideas / нет режима) — переключаем на показ
+        was_busy = False
+        state["mode"] = "approving_post"
+        state["current_post_index"] = len(pending) - 1
+
     save_state(state)
 
     if not chat_id:
-        log.warning("owner_chat_id не задан — пост добавлен в очередь но уведомление не отправлено")
+        log.warning("owner_chat_id не задан — пост добавлен в очередь без уведомления")
         return
 
-    # Присылаем картинку
+    if was_busy:
+        notice = (
+            f"📬 *+1 пост в очереди:* {label}\n"
+            f"Сейчас ты занят — закончи текущее действие, пост покажется автоматически.\n"
+            f"Или напиши /show чтобы посмотреть очередь сейчас."
+        )
+        try:
+            req.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": notice, "parse_mode": "Markdown"},
+                timeout=30,
+            )
+        except Exception as e:
+            log.warning(f"Не удалось отправить уведомление об очереди: {e}")
+        log.info(f"Пост добавлен в очередь (mode={current_mode}): {label}")
+        return
+
+    # Свободен — присылаем картинку и текст на согласование
+    final_text = f"{post_text}\n\nНапиши мне → @Nzamba\nhttps://sevrugin.pro"
+
     if image_path:
         try:
             with open(image_path, "rb") as photo:
@@ -105,12 +133,11 @@ def _queue_for_approval(post_text: str, image_path: str, label: str):
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
                     data={"chat_id": chat_id},
                     files={"photo": photo},
-                    timeout=30
+                    timeout=30,
                 )
         except Exception as e:
             log.warning(f"Не удалось отправить картинку: {e}")
 
-    # Присылаем текст на согласование
     caption = (
         f"📝 *{label}*\n\n{final_text}\n\n"
         f"Напиши *ок* — опубликую\n"
@@ -120,7 +147,7 @@ def _queue_for_approval(post_text: str, image_path: str, label: str):
     req.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         json={"chat_id": chat_id, "text": caption, "parse_mode": "Markdown"},
-        timeout=30
+        timeout=30,
     )
     log.info(f"Пост отправлен на согласование: {label}")
 
@@ -227,26 +254,29 @@ def publish_post(topic_id: str = None):
 
 
 def send_ideas_sync():
-    """Запускает исследование и отправляет идеи через Telegram Bot API."""
+    """Запускает исследование и отправляет идеи с inline-кнопками через Bot API."""
+    import hashlib
     import requests as req
     from researcher import run_research
     from config import TELEGRAM_BOT_TOKEN
     from bot import load_state, save_state
+    import ideas_history
 
-    # Получаем chat_id из состояния
     state = load_state()
     chat_id = state.get("owner_chat_id")
     if not chat_id:
         log.warning("owner_chat_id не задан — запусти /myid в боте")
         return
 
-    def send(text):
-        req.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        )
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-    send("🔍 Ищу свежие идеи из иностранных источников...")
+    def send(text, reply_markup=None):
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        req.post(f"{api}/sendMessage", json=payload, timeout=30)
+
+    send("🔍 Ищу свежие идеи из российских и зарубежных источников...")
 
     try:
         ideas = run_research()
@@ -258,17 +288,43 @@ def send_ideas_sync():
         send("Не удалось найти идеи сегодня.")
         return
 
-    state["mode"] = "selecting_ideas"
-    state["ideas"] = ideas
+    # Фильтруем по истории + готовим dict {hash: idea}
+    ideas_dict = {}
+    for idea in ideas:
+        if ideas_history.is_blocked(idea.get("idea", "")):
+            log.info(f"Идея отфильтрована: {idea.get('idea','')[:60]}")
+            continue
+        idea_id = hashlib.md5(
+            (idea.get("idea", "") + idea.get("angle", "")).encode("utf-8")
+        ).hexdigest()[:10]
+        ideas_dict[idea_id] = idea
+
+    if not ideas_dict:
+        send("Все найденные идеи уже были предложены раньше. Попробуй /research позже.")
+        return
+
+    state["ideas"] = ideas_dict
+    # mode НЕ переключаем — кнопки работают независимо
     save_state(state)
 
-    lines = ["📋 *Идеи на сегодня* — ответь номерами через запятую:\n"]
-    for i, idea in enumerate(ideas, 1):
-        lines.append(f"*{i}.* {idea['idea']}\n_{idea['angle']}_\n📌 {idea['source']}\n")
-    lines.append("Например: `1, 3, 5`")
+    send(f"📋 *Идеи на сегодня* ({len(ideas_dict)}) — нажми кнопку под каждой:")
 
-    send("\n".join(lines))
-    log.info("Идеи отправлены пользователю")
+    for idea_id, idea in ideas_dict.items():
+        text = (
+            f"💡 *{idea['idea']}*\n\n"
+            f"_{idea['angle']}_\n\n"
+            f"📌 {idea['source']}"
+        )
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "✅ Используем", "callback_data": f"idea:use:{idea_id}"},
+                {"text": "⏸ Отложить",   "callback_data": f"idea:postpone:{idea_id}"},
+                {"text": "🗑 Убрать",     "callback_data": f"idea:remove:{idea_id}"},
+            ]]
+        }
+        send(text, reply_markup=keyboard)
+
+    log.info(f"Идеи отправлены пользователю: {len(ideas_dict)}")
 
 
 def run_scheduler():

@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.ogg
 bot_state.json
+ideas_history.json
+bot.pid
+bot_err.log
+bot_run.log
+*.mp4
 draft.txt
 *.png
 *.jpg

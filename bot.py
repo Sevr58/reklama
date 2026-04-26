@@ -19,23 +19,25 @@ import re
 import sys
 import uuid
 import json
+import hashlib
 import logging
 import asyncio
 import threading
 from pathlib import Path
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
 import openai
 
 from config import TELEGRAM_BOT_TOKEN, OPENAI_API_KEY
+import ideas_history
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,22 +132,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["mode"] = "idle"
             save_state(state)
             await update.message.reply_text("🗑 Видео пропущено.")
+            await show_next_post(update, context)
             return
         await update.message.reply_text(
             "Отправь видеофайл или напиши *пропустить видео*", parse_mode="Markdown"
         )
         return
 
-    # Режим ожидания картинки
+    # Режим ожидания медиа (картинки или видео)
     if mode == "waiting_for_image":
         await update.message.reply_text(
-            "Отправь картинку (фото), а не текст."
+            "Отправь картинку или видео, а не текст."
         )
         return
 
-    if mode == "selecting_ideas":
-        await handle_idea_selection(update, context)
-        return
     if mode == "approving_post":
         await handle_approval(update, context)
         return
@@ -183,9 +183,46 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Утренняя рассылка идей ───────────────────────────────────────────────────
 
+def _idea_hash(text: str) -> str:
+    """Короткий стабильный id идеи для callback_data."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
+
+
+def _idea_keyboard(idea_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Используем", callback_data=f"idea:use:{idea_id}"),
+        InlineKeyboardButton("⏸ Отложить", callback_data=f"idea:postpone:{idea_id}"),
+        InlineKeyboardButton("🗑 Убрать", callback_data=f"idea:remove:{idea_id}"),
+    ]])
+
+
+async def _send_ideas_with_buttons(app: Application, chat_id: int, ideas_dict: dict):
+    """Отправляет каждую идею отдельным сообщением с inline-кнопками."""
+    await app.bot.send_message(
+        chat_id,
+        f"📋 *Идеи на сегодня* ({len(ideas_dict)}) — нажми кнопку под каждой:",
+        parse_mode="Markdown",
+    )
+    for idea_id, idea in ideas_dict.items():
+        text = (
+            f"💡 *{idea['idea']}*\n\n"
+            f"_{idea['angle']}_\n\n"
+            f"📌 {idea['source']}"
+        )
+        try:
+            await app.bot.send_message(
+                chat_id,
+                text,
+                parse_mode="Markdown",
+                reply_markup=_idea_keyboard(idea_id),
+            )
+        except Exception as e:
+            log.warning(f"Не удалось отправить идею {idea_id}: {e}")
+
+
 async def send_daily_ideas(app: Application, chat_id: int):
-    """Запускает исследование и отправляет идеи пользователю."""
-    await app.bot.send_message(chat_id, "🔍 Ищу свежие идеи из иностранных источников...")
+    """Запускает новое исследование и отправляет идеи пользователю с кнопками."""
+    await app.bot.send_message(chat_id, "🔍 Ищу свежие идеи из российских и зарубежных источников...")
 
     try:
         from researcher import run_research
@@ -199,79 +236,140 @@ async def send_daily_ideas(app: Application, chat_id: int):
         await app.bot.send_message(chat_id, "Не удалось найти идеи. Попробуй позже или добавь вручную.")
         return
 
-    # Сохраняем идеи в состояние
-    state = load_state()
-    state["mode"] = "selecting_ideas"
-    state["ideas"] = ideas
-    state["chat_id"] = chat_id
-    save_state(state)
+    # Превращаем список в dict {hash: idea}, отбрасываем дубли по истории
+    ideas_dict: dict = {}
+    for idea in ideas:
+        if ideas_history.is_blocked(idea.get("idea", "")):
+            log.info(f"Идея отфильтрована (used/postponed/removed): {idea.get('idea','')[:60]}")
+            continue
+        idea_id = _idea_hash(idea.get("idea", "") + idea.get("angle", ""))
+        ideas_dict[idea_id] = idea
 
-    # Формируем сообщение
-    lines = ["📋 *Идеи на сегодня* — выбери номера через запятую:\n"]
-    for i, idea in enumerate(ideas, 1):
-        lines.append(f"*{i}.* {idea['idea']}\n_{idea['angle']}_\n📌 {idea['source']}\n")
-
-    lines.append("Например: `1, 3, 5` — и я сгенерирую посты по выбранным идеям.")
-
-    await app.bot.send_message(
-        chat_id,
-        "\n".join(lines),
-        parse_mode="Markdown"
-    )
-
-
-async def handle_idea_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь выбрал идеи по номерам."""
-    text = update.message.text.strip()
-    state = load_state()
-    ideas = state.get("ideas", [])
-
-    # Парсим номера
-    numbers = [int(n.strip()) for n in re.split(r'[,\s]+', text) if n.strip().isdigit()]
-    selected = [ideas[n-1] for n in numbers if 1 <= n <= len(ideas)]
-
-    if not selected:
-        await update.message.reply_text("Не понял выбор. Напиши номера через запятую, например: 1, 3")
+    if not ideas_dict:
+        await app.bot.send_message(
+            chat_id,
+            "Все найденные идеи уже были предложены раньше. Попробуй /research позже.",
+        )
         return
 
-    await update.message.reply_text(
-        f"✅ Выбрано {len(selected)} идей. Генерирую посты..."
-    )
+    state = load_state()
+    state["ideas"] = ideas_dict
+    state["chat_id"] = chat_id
+    # mode НЕ переключаем — кнопки работают независимо от режима
+    save_state(state)
 
-    state["mode"] = "approving_post"
-    state["pending_posts"] = []
-    state["current_post_index"] = 0
+    await _send_ideas_with_buttons(app, chat_id, ideas_dict)
 
-    # Генерируем посты для выбранных идей
-    from content import generate_post, generate_image_prompt
-    from topics import get_topic_by_id
+
+async def _generate_post_for_idea(idea: dict) -> str:
+    """Генерирует текст поста по идее (синхронный generate_post в executor)."""
+    from content import generate_post
 
     draft_topic = {
         "name": "Из исследования",
         "description": "",
-        "prompt_hint": "",
-        "image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"
+        "prompt_hint": f"{idea['idea']}. {idea['angle']}",
+        "image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic",
     }
+    return await asyncio.get_running_loop().run_in_executor(
+        None, lambda: generate_post(draft_topic)
+    )
 
-    for idea in selected:
+
+async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки под идеями."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, action, idea_id = query.data.split(":", 2)
+    except ValueError:
+        return
+
+    state = load_state()
+    ideas_dict = state.get("ideas") or {}
+    # Обратная совместимость: старый формат (list) — игнорируем колбэк
+    if isinstance(ideas_dict, list):
+        ideas_dict = {}
+
+    idea = ideas_dict.get(idea_id)
+    if not idea:
         try:
-            draft_topic["prompt_hint"] = f"{idea['idea']}. {idea['angle']}"
-            post_text = await asyncio.get_running_loop().run_in_executor(
-                None, lambda t=draft_topic: generate_post(t)
-            )
-            state["pending_posts"].append({
-                "idea": idea["idea"],
-                "post_text": post_text,
-            })
+            await query.edit_message_text("⚠️ Идея устарела (новое исследование уже запущено).")
+        except Exception:
+            pass
+        return
+
+    title = idea.get("idea", "")
+
+    if action == "remove":
+        ideas_history.mark_removed(title, title)
+        ideas_dict.pop(idea_id, None)
+        state["ideas"] = ideas_dict
+        save_state(state)
+        try:
+            await query.edit_message_text(f"🗑 *Убрано навсегда:* {title}", parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    if action == "postpone":
+        ideas_history.mark_postponed(title, title)
+        ideas_dict.pop(idea_id, None)
+        state["ideas"] = ideas_dict
+        save_state(state)
+        try:
+            await query.edit_message_text(f"⏸ *Отложено:* {title}\n\n_(вернётся в выдачу позже)_", parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    if action == "use":
+        try:
+            await query.edit_message_text(f"🎨 *Генерирую пост:* {title}", parse_mode="Markdown")
+        except Exception:
+            pass
+        try:
+            post_text = await _generate_post_for_idea(idea)
         except Exception as e:
-            log.warning(f"Ошибка генерации поста: {e}")
+            log.exception("Ошибка генерации поста")
+            await context.bot.send_message(query.message.chat.id, f"❌ Ошибка генерации: {e}")
+            return
 
-    save_state(state)
-    await show_next_post(update, context)
+        ideas_history.mark_used(title, title)
+
+        # Перечитываем state — за время генерации он мог измениться
+        state = load_state()
+        ideas_dict = state.get("ideas") or {}
+        if isinstance(ideas_dict, dict):
+            ideas_dict.pop(idea_id, None)
+            state["ideas"] = ideas_dict
+
+        posts = state.get("pending_posts", [])
+        posts.append({"idea": title, "post_text": post_text})
+        state["pending_posts"] = posts
+
+        # Если бот сейчас не показывает пост — переключаемся и показываем новый
+        was_idle = state.get("mode") != "approving_post"
+        if was_idle:
+            state["mode"] = "approving_post"
+            state["current_post_index"] = len(posts) - 1
+        save_state(state)
+
+        chat_id = query.message.chat.id
+
+        if was_idle:
+            await _show_post_to_chat(context.application, chat_id)
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"📬 Пост *«{title}»* добавлен в очередь ({len(posts) - state.get('current_post_index', 0)} ждут).",
+                parse_mode="Markdown",
+            )
 
 
-async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает следующий пост на согласование."""
+async def _show_post_to_chat(app: Application, chat_id: int):
+    """Показывает текущий pending пост по chat_id (без объекта Update)."""
     state = load_state()
     posts = state.get("pending_posts", [])
     idx = state.get("current_post_index", 0)
@@ -279,29 +377,53 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if idx >= len(posts):
         state["mode"] = "idle"
         save_state(state)
-        await update.message.reply_text("✅ Все посты обработаны!")
+        await app.bot.send_message(chat_id, "✅ Все посты обработаны!")
         return
 
     post = posts[idx]
-    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
-    final_text = f"{post['post_text']}\n\n{signature}"
+    final_text = f"{post['post_text']}\n\nНапиши мне → @Nzamba\nhttps://sevrugin.pro"
     image_path = post.get("preview_image")
+    video_path = post.get("preview_video")
 
-    if image_path and Path(image_path).exists():
-        # Картинка уже есть (YouTube-превью или загружена вручную) — сразу на согласование
+    has_image = image_path and Path(image_path).exists()
+    has_video = video_path and Path(video_path).exists()
+
+    approval_text = (
+        f"📝 *Пост {idx+1}/{len(posts)}* — {post.get('idea', '')}\n\n{final_text}\n\n"
+        f"*ок* / *да* / *го* — публикую\n"
+        f"*пропустить* — следующий\n"
+        f"Или напиши правки — переделаю и покажу снова (можно несколько раз)"
+    )
+
+    if has_video or has_image:
         state["mode"] = "approving_post"
         save_state(state)
-        with open(image_path, "rb") as photo:
-            await update.message.reply_photo(photo=photo)
-        await update.message.reply_text(
-            f"📝 *Пост {idx+1}/{len(posts)}* — {post.get('idea', '')}\n\n{final_text}\n\n"
-            f"*ок* / *да* / *го* — публикую\n"
-            f"*пропустить* — следующий\n"
-            f"Или напиши правки — переделаю и покажу снова (можно несколько раз)",
-            parse_mode="Markdown"
-        )
+
+        for attempt in range(3):
+            try:
+                if has_video:
+                    with open(video_path, "rb") as vid:
+                        await app.bot.send_video(chat_id, video=vid)
+                else:
+                    with open(image_path, "rb") as photo:
+                        await app.bot.send_photo(chat_id, photo=photo)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    log.warning(f"Не удалось отправить медиа после 3 попыток: {e}")
+                else:
+                    await asyncio.sleep(2)
+
+        for attempt in range(3):
+            try:
+                await app.bot.send_message(chat_id, approval_text, parse_mode="Markdown")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    log.warning(f"Не удалось отправить текст поста после 3 попыток: {e}")
+                else:
+                    await asyncio.sleep(2)
     else:
-        # Нет картинки — просим сгенерировать вручную на AI Studio
         from content import generate_image_prompt
         draft_topic = {"image_style": "hyperrealistic product photography, cream and forest green palette, luxury aesthetic"}
         image_prompt = await asyncio.get_running_loop().run_in_executor(
@@ -311,17 +433,24 @@ async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["pending_posts"] = posts
         save_state(state)
 
-        await update.message.reply_text(
+        await app.bot.send_message(
+            chat_id,
             f"📝 *Пост {idx+1}/{len(posts)}* — {post.get('idea', '')}\n\n{final_text}",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
-        await update.message.reply_text(
+        await app.bot.send_message(
+            chat_id,
             f"🎨 *Промпт для картинки* — вставь в AI Studio:\n\n`{image_prompt}`\n\n"
             f"[Открыть Google AI Studio](https://aistudio.google.com/generate-image)\n\n"
-            f"Сгенерируй и отправь картинку сюда.",
+            f"Сгенерируй и отправь картинку или видео сюда.",
             parse_mode="Markdown",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
+
+
+async def show_next_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает следующий пост на согласование (обёртка для message-контекста)."""
+    await _show_post_to_chat(context.application, update.effective_chat.id)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,13 +488,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь прислал видео для Shorts/Reels."""
+    """Пользователь прислал видео — для поста или для Shorts/Reels."""
     state = load_state()
+    mode = state.get("mode")
 
-    if state.get("mode") != "waiting_for_video":
+    if mode not in ("waiting_for_video", "waiting_for_image", "approving_post"):
         return
-
-    await update.message.reply_text("💾 Сохраняю видео...")
 
     if update.message.video:
         file = await update.message.video.get_file()
@@ -375,17 +503,29 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     save_path = str(Path(__file__).parent / f"temp_video_{uuid.uuid4().hex[:8]}.mp4")
+    await update.message.reply_text("💾 Сохраняю видео...")
     await file.download_to_drive(save_path)
 
-    state["pending_video"] = save_path
-    save_state(state)
+    if mode == "waiting_for_video":
+        # Видео для YouTube Shorts / Instagram Reels после публикации поста
+        state["pending_video"] = save_path
+        save_state(state)
+        await update.message.reply_text(
+            "🎬 Видео получено!\n\n"
+            "Напиши *публикую видео* — залью в YouTube Shorts + Instagram Reels\n"
+            "Или *пропустить видео* — удалю",
+            parse_mode="Markdown"
+        )
 
-    await update.message.reply_text(
-        "🎬 Видео получено!\n\n"
-        "Напиши *публикую видео* — залью в YouTube Shorts + Instagram Reels\n"
-        "Или *пропустить видео* — удалю",
-        parse_mode="Markdown"
-    )
+    elif mode in ("waiting_for_image", "approving_post"):
+        # Видео как превью поста (вместо картинки)
+        posts = state.get("pending_posts", [])
+        idx = state.get("current_post_index", 0)
+        posts[idx]["preview_video"] = save_path
+        posts[idx].pop("preview_image", None)  # убираем картинку если была
+        state["pending_posts"] = posts
+        save_state(state)
+        await show_next_post(update, context)
 
 
 def _build_progress(results: dict, current: str = "") -> str:
@@ -408,9 +548,15 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = state.get("current_post_index", 0)
     post = posts[idx]
 
-    signature = "Напиши мне → @Nzamba\nsevrugin.pro"
-    final_text = f"{post['post_text']}\n\n{signature}"
+    body = post['post_text']
+    tg_text  = f"{body}\n\nНапиши мне → @Nzamba\nhttps://sevrugin.pro"
+    ig_text  = f"{body}\n\nНапиши мне → @sevrugin_pro"
+    fb_text  = f"{body}\n\nsevrugin.pro"
+    x_text   = f"{body}\n\nsevrugin.pro"
     preview_image = post.get("preview_image")
+    preview_video = post.get("preview_video")
+    # для превью в боте используем тг-версию
+    final_text = tg_text
 
     if text in ("ок", "ok", "окей", "давай", "публикуй", "публикую", "да", "го", "вперед", "вперёд"):
         status_msg = await update.message.reply_text("🚀 Публикую...")
@@ -435,10 +581,10 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         from poster import post_telegram, post_social
 
-        await step("📤", "Telegram",   lambda: post_telegram(final_text, preview_image))
-        await step("📸", "Instagram",  lambda: post_social(final_text, preview_image, ["instagram"]))
-        await step("👥", "Facebook",   lambda: post_social(final_text, preview_image, ["facebook"]))
-        await step("🐦", "X",          lambda: post_social(final_text, preview_image, ["x"]))
+        await step("📤", "Telegram",   lambda: post_telegram(tg_text, preview_image, preview_video))
+        await step("📸", "Instagram",  lambda: post_social(ig_text, preview_image, preview_video, ["instagram"]))
+        await step("👥", "Facebook",   lambda: post_social(fb_text, preview_image, preview_video, ["facebook"]))
+        await step("🐦", "X",          lambda: post_social(x_text,  preview_image, preview_video, ["x"]))
 
         await status_msg.edit_text(_build_progress(results, "📝 Блог (генерирую статью ~30 сек)..."))
         try:
@@ -449,9 +595,9 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results["Блог"] = ("❌", str(e))
         await status_msg.edit_text(_build_progress(results))
 
-        if preview_image:
+        for media_file in filter(None, [preview_image, preview_video]):
             try:
-                Path(preview_image).unlink(missing_ok=True)
+                Path(media_file).unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -518,6 +664,7 @@ async def handle_video_publish(update: Update, context: ContextTypes.DEFAULT_TYP
         state["mode"] = "idle"
         save_state(state)
         await update.message.reply_text("✅ YouTube Shorts + Instagram Reels опубликованы!")
+        await show_next_post(update, context)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -578,16 +725,45 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"[/raw] черновик #{number} поставлен в очередь")
 
 async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запустить исследование вручную."""
+    """Показать уже полученные сегодня идеи (с кнопками). НЕ запускает новое исследование."""
+    state = load_state()
+    state["owner_chat_id"] = update.effective_chat.id
+    save_state(state)
+
+    ideas_dict = state.get("ideas") or {}
+    if isinstance(ideas_dict, list):
+        ideas_dict = {}
+
+    if not ideas_dict:
+        await update.message.reply_text(
+            "Сегодня идей пока нет. Напиши /research чтобы запустить новое исследование."
+        )
+        return
+
+    await _send_ideas_with_buttons(context.application, update.effective_chat.id, ideas_dict)
+
+
+async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запустить новое исследование вручную."""
+    state = load_state()
+    state["owner_chat_id"] = update.effective_chat.id
+    save_state(state)
     await send_daily_ideas(context.application, update.effective_chat.id)
 
 
 async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Повторно показать текущий пост на согласование."""
+    """Показать текущий или следующий пост из очереди (даже если mode=idle)."""
     state = load_state()
-    if state.get("mode") != "approving_post":
-        await update.message.reply_text("Сейчас нет поста на согласовании.")
+    posts = state.get("pending_posts", [])
+    idx = state.get("current_post_index", 0)
+
+    if not posts or idx >= len(posts):
+        await update.message.reply_text("Очередь постов пуста.")
         return
+
+    # Принудительно переключаемся в режим согласования
+    state["mode"] = "approving_post"
+    save_state(state)
     await show_next_post(update, context)
 
 
@@ -669,8 +845,10 @@ def main():
     app.add_handler(CommandHandler("publish", cmd_publish))
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("ideas", cmd_ideas))
+    app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CallbackQueryHandler(handle_idea_callback, pattern=r"^idea:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
