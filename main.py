@@ -230,7 +230,7 @@ def publish_post(topic_id: str = None):
     post_text = generate_post(topic)
     log.info(f"Текст готов ({len(post_text)} симв.)")
 
-    # Ищем YouTube-превью (бесплатно). Картинку пользователь сгенерирует вручную в AI Studio.
+    # Ищем YouTube-превью (бесплатно). Картинку пользователь сгенерирует вручную через gpt-image-2.
     image_path = None
     youtube_url = None
 

@@ -161,25 +161,45 @@ IMAGE_STYLE_GUIDE = """Visual style rules (follow strictly):
   * Abstract: flowing geometric shapes suggesting movement or strategy, green-gold-cream palette, premium feel
 - The image must feel like it belongs on a luxury brand's Instagram feed"""
 
+
 def generate_image_prompt(topic: dict, post_text: str) -> str:
-    """Генерирует промпт для Imagen 4 на основе поста."""
+    """Генерирует промпт для gpt-image-2 на основе поста.
+
+    Промпт строится в два шага:
+      1. Claude читает ВЕСЬ текст поста и выделяет ключевую идею +
+         конкретную визуальную метафору, которая её передаёт.
+      2. На основе метафоры собирается финальный промпт по гайду.
+    """
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
+        max_tokens=400,
         messages=[
             {
                 "role": "user",
-                "content": f"""Create a short image generation prompt in English (2-3 sentences) for this post.
+                "content": f"""You write image prompts for gpt-image-2 that illustrate Telegram posts about advertising and marketing.
+
+Read the FULL post below. Then build an image prompt that has a clear, recognizable visual link to the post's main idea — not just a generic "luxury object on cream linen". A reader who sees the picture and reads the post should feel "yes, this image is exactly about THIS text".
+
+Full post:
+\"\"\"
+{post_text}
+\"\"\"
+
+Process:
+1. In your head, identify the ONE main idea, conflict, or metaphor of the post (don't write this out).
+2. Pick a concrete visual subject that embodies that idea (an object, a scene, a geometric arrangement). Avoid clichés like "lightbulb = idea" or "rocket = growth".
+3. Compose the prompt in English, 4–6 sentences, with: subject, composition, lighting, materials/textures, mood, and explicit style.
 
 {IMAGE_STYLE_GUIDE}
 
-Post theme (use for visual concept only):
-{post_text[:200]}
-
-Reply with the prompt only, no explanations."""
+Hard rules:
+- The visual must clearly relate to the specific topic of THIS post, not be a generic luxury still life.
+- No text, words, letters, logos, watermarks, no human faces.
+- Square 1:1.
+- Output ONLY the final prompt in English. No explanations, no preamble, no markdown, no quotes."""
             }
         ]
     )
 
-    return message.content[0].text
+    return message.content[0].text.strip()

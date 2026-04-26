@@ -440,8 +440,7 @@ async def _show_post_to_chat(app: Application, chat_id: int):
         )
         await app.bot.send_message(
             chat_id,
-            f"🎨 *Промпт для картинки* — вставь в AI Studio:\n\n`{image_prompt}`\n\n"
-            f"[Открыть Google AI Studio](https://aistudio.google.com/generate-image)\n\n"
+            f"🎨 *Промпт для картинки* — вставь в gpt-image-2:\n\n`{image_prompt}`\n\n"
             f"Сгенерируй и отправь картинку или видео сюда.",
             parse_mode="Markdown",
             disable_web_page_preview=True,
