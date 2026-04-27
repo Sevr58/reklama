@@ -380,18 +380,22 @@ async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             posts.append({"idea": title, "post_text": post_text})
             state["pending_posts"] = posts
 
-            was_idle = state.get("mode") != "approving_post"
-            if was_idle:
+            current_mode = state.get("mode")
+            busy = current_mode in ("approving_post", "waiting_for_image", "waiting_for_video")
+
+            if not busy:
+                # Бот свободен — переключаемся на новый пост и показываем
                 state["mode"] = "approving_post"
                 state["current_post_index"] = len(posts) - 1
             save_state(state)
 
-            if was_idle:
+            if not busy:
                 await _show_post_to_chat(context.application, chat_id)
             else:
+                queue_left = len(posts) - state.get("current_post_index", 0)
                 await context.bot.send_message(
                     chat_id,
-                    f"📬 Пост *«{title}»* добавлен в очередь ({len(posts) - state.get('current_post_index', 0)} ждут).",
+                    f"📬 Пост *«{title}»* добавлен в очередь (всего ждут: {queue_left}).",
                     parse_mode="Markdown",
                 )
         except Exception as e:
