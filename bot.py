@@ -31,6 +31,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
     filters,
     ContextTypes,
 )
@@ -871,6 +872,22 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_on_startup).build()
 
+    async def _log_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        kind = "?"
+        if update.callback_query:
+            kind = f"callback_query data={update.callback_query.data!r}"
+        elif update.message:
+            kind = f"message text={update.message.text!r}"
+        elif update.edited_message:
+            kind = f"edited_message text={update.edited_message.text!r}"
+        log.info(f"[update] type={kind}")
+
+    async def _on_error(update, context):
+        log.error("Unhandled error", exc_info=context.error)
+
+    app.add_handler(TypeHandler(Update, _log_update), group=-1)
+    app.add_error_handler(_on_error)
+
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("publish", cmd_publish))
@@ -886,7 +903,11 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     log.info("Бот запущен.")
-    app.run_polling(bootstrap_retries=-1)
+    app.run_polling(
+        bootstrap_retries=-1,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
