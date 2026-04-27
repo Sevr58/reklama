@@ -39,9 +39,14 @@ import openai
 from config import TELEGRAM_BOT_TOKEN, OPENAI_API_KEY
 import ideas_history
 
+_LOG_FILE = Path(__file__).parent / "bot_run.log"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger(__name__)
 
@@ -303,15 +308,21 @@ async def _generate_post_for_idea(idea: dict) -> str:
 async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на кнопки под идеями."""
     query = update.callback_query
-    await query.answer()
+    log.info(f"[idea-callback] data={query.data!r} from chat={query.message.chat.id if query.message else '?'}")
+    try:
+        await query.answer()
+    except Exception as e:
+        log.warning(f"[idea-callback] query.answer failed: {e}")
 
     try:
         _, action, idea_id = query.data.split(":", 2)
     except ValueError:
+        log.warning(f"[idea-callback] bad data {query.data!r}")
         return
 
     state = load_state()
     ideas_dict = _ensure_ideas_dict(state)
+    log.info(f"[idea-callback] action={action} id={idea_id} known_ids={list(ideas_dict.keys())}")
 
     idea = ideas_dict.get(idea_id)
     if not idea:
@@ -346,46 +357,48 @@ async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if action == "use":
-        try:
-            await query.edit_message_text(f"🎨 *Генерирую пост:* {title}", parse_mode="Markdown")
-        except Exception:
-            pass
-        try:
-            post_text = await _generate_post_for_idea(idea)
-        except Exception as e:
-            log.exception("Ошибка генерации поста")
-            await context.bot.send_message(query.message.chat.id, f"❌ Ошибка генерации: {e}")
-            return
-
-        ideas_history.mark_used(title, title)
-
-        # Перечитываем state — за время генерации он мог измениться
-        state = load_state()
-        ideas_dict = _ensure_ideas_dict(state)
-        ideas_dict.pop(idea_id, None)
-        state["ideas"] = ideas_dict
-
-        posts = state.get("pending_posts", [])
-        posts.append({"idea": title, "post_text": post_text})
-        state["pending_posts"] = posts
-
-        # Если бот сейчас не показывает пост — переключаемся и показываем новый
-        was_idle = state.get("mode") != "approving_post"
-        if was_idle:
-            state["mode"] = "approving_post"
-            state["current_post_index"] = len(posts) - 1
-        save_state(state)
-
         chat_id = query.message.chat.id
+        try:
+            try:
+                await query.edit_message_text(f"🎨 *Генерирую пост:* {title}", parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"[idea-callback] edit_message_text failed: {e}")
 
-        if was_idle:
-            await _show_post_to_chat(context.application, chat_id)
-        else:
-            await context.bot.send_message(
-                chat_id,
-                f"📬 Пост *«{title}»* добавлен в очередь ({len(posts) - state.get('current_post_index', 0)} ждут).",
-                parse_mode="Markdown",
-            )
+            log.info(f"[idea-callback] generating post for {title!r}")
+            post_text = await _generate_post_for_idea(idea)
+            log.info(f"[idea-callback] post generated, len={len(post_text)}")
+
+            ideas_history.mark_used(title, title)
+
+            state = load_state()
+            ideas_dict = _ensure_ideas_dict(state)
+            ideas_dict.pop(idea_id, None)
+            state["ideas"] = ideas_dict
+
+            posts = state.get("pending_posts", [])
+            posts.append({"idea": title, "post_text": post_text})
+            state["pending_posts"] = posts
+
+            was_idle = state.get("mode") != "approving_post"
+            if was_idle:
+                state["mode"] = "approving_post"
+                state["current_post_index"] = len(posts) - 1
+            save_state(state)
+
+            if was_idle:
+                await _show_post_to_chat(context.application, chat_id)
+            else:
+                await context.bot.send_message(
+                    chat_id,
+                    f"📬 Пост *«{title}»* добавлен в очередь ({len(posts) - state.get('current_post_index', 0)} ждут).",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            log.exception("Ошибка в обработке 'Используем'")
+            try:
+                await context.bot.send_message(chat_id, f"❌ Ошибка: {e}")
+            except Exception:
+                pass
 
 
 async def _show_post_to_chat(app: Application, chat_id: int):
