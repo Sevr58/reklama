@@ -188,6 +188,30 @@ def _idea_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
 
 
+def _ensure_ideas_dict(state: dict) -> dict:
+    """Нормализует state['ideas'] в dict {hash: idea}.
+
+    Если в состоянии лежит старый list (например, от ещё не перезапущенного
+    планировщика main.py), конвертирует его в dict и сохраняет state.
+    """
+    raw = state.get("ideas") or {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        result: dict = {}
+        for idea in raw:
+            if not isinstance(idea, dict):
+                continue
+            title = idea.get("idea", "")
+            angle = idea.get("angle", "")
+            idea_id = _idea_hash(title + angle)
+            result[idea_id] = idea
+        state["ideas"] = result
+        save_state(state)
+        return result
+    return {}
+
+
 def _idea_keyboard(idea_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Используем", callback_data=f"idea:use:{idea_id}"),
@@ -287,10 +311,7 @@ async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     state = load_state()
-    ideas_dict = state.get("ideas") or {}
-    # Обратная совместимость: старый формат (list) — игнорируем колбэк
-    if isinstance(ideas_dict, list):
-        ideas_dict = {}
+    ideas_dict = _ensure_ideas_dict(state)
 
     idea = ideas_dict.get(idea_id)
     if not idea:
@@ -340,10 +361,9 @@ async def handle_idea_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Перечитываем state — за время генерации он мог измениться
         state = load_state()
-        ideas_dict = state.get("ideas") or {}
-        if isinstance(ideas_dict, dict):
-            ideas_dict.pop(idea_id, None)
-            state["ideas"] = ideas_dict
+        ideas_dict = _ensure_ideas_dict(state)
+        ideas_dict.pop(idea_id, None)
+        state["ideas"] = ideas_dict
 
         posts = state.get("pending_posts", [])
         posts.append({"idea": title, "post_text": post_text})
@@ -729,9 +749,8 @@ async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["owner_chat_id"] = update.effective_chat.id
     save_state(state)
 
-    ideas_dict = state.get("ideas") or {}
-    if isinstance(ideas_dict, list):
-        ideas_dict = {}
+    state = load_state()
+    ideas_dict = _ensure_ideas_dict(state)
 
     if not ideas_dict:
         await update.message.reply_text(
