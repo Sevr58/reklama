@@ -2,13 +2,14 @@
 Публикация постов на сайт sevrugin.pro/blog/
 
 Берёт Telegram-пост, разворачивает в полноценную статью,
-создаёт HTML-файл, обновляет blog/index.html и загружает на сервер.
+создаёт HTML-файл, обновляет blog/index.html и публикует через git push
+в репозиторий sevrugin-site → Cloudflare Pages автоматически деплоит.
 """
 
 import re
-import ftplib
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -22,10 +23,6 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 SITE_DIR = Path("C:/Users/30889/Claude/Site")
 BLOG_DIR = SITE_DIR / "blog"
-
-FTP_HOST = "a30889y0.beget.tech"
-FTP_USER = "a30889y0_sevrugin"
-FTP_PASS = "Sevr1982!!!"
 
 SVG_ARROW = '<svg viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
@@ -250,28 +247,57 @@ def update_blog_index(article: dict, slug: str):
     log.info("blog/index.html обновлён")
 
 
-# ─── Загрузка на сервер по FTP ────────────────────────────────────────────────
+# ─── Публикация через git push (Cloudflare Pages подхватит автоматически) ────
 
-def upload_files(files: list[tuple[Path, str]]):
-    """Загружает список (локальный_путь, удалённый_путь) на FTP-сервер."""
+def _git(*args: str, timeout: int = 120) -> str:
+    """Запускает git в SITE_DIR, возвращает stdout, кидает RuntimeError при ошибке."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(SITE_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} → код {result.returncode}\n"
+            f"stdout: {result.stdout.strip()}\nstderr: {result.stderr.strip()}"
+        )
+    return result.stdout
 
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, 21, timeout=60)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.set_pasv(False)
 
-    for local_path, remote_path in files:
-        with open(local_path, "rb") as f:
-            ftp.storbinary(f"STOR {remote_path}", f)
-        log.info(f"Загружено: {remote_path}")
+def publish_via_git(article_path: Path, slug: str, title: str):
+    """Коммитит новую статью + обновлённый index.html и пушит в origin/master.
 
-    ftp.quit()
+    Cloudflare Pages, привязанный к репо Sevr58/sevrugin-site, после push
+    автоматически собирает и публикует сайт — обычно в течение 30-90 секунд.
+    """
+    files_to_add = [
+        str(article_path.relative_to(SITE_DIR)).replace("\\", "/"),
+        "blog/index.html",
+    ]
+
+    _git("add", *files_to_add)
+
+    status = _git("status", "--porcelain", *files_to_add).strip()
+    if not status:
+        log.warning("В git нет изменений по статье и index.html — нечего публиковать.")
+        return
+
+    commit_msg = f"Add blog post: {title[:60]}"
+    _git("commit", "-m", commit_msg)
+    log.info(f"Git commit создан: {commit_msg}")
+
+    push_out = _git("push", "origin", "HEAD:master", timeout=180)
+    log.info(f"Git push выполнен. {push_out.strip()[:200]}")
 
 
 # ─── Главная функция ──────────────────────────────────────────────────────────
 
 def publish_to_blog(post_text: str):
-    """Полный цикл: пост → статья → HTML → сайт."""
+    """Полный цикл: пост → статья → HTML → git push → Cloudflare Pages."""
 
     log.info("Генерирую статью для блога...")
     article = generate_article(post_text)
@@ -281,11 +307,9 @@ def publish_to_blog(post_text: str):
     article_path = create_article_html(article, slug)
     update_blog_index(article, slug)
 
-    log.info("Загружаю на сервер...")
-    upload_files([
-        (article_path, f"blog/{slug}.html"),
-        (BLOG_DIR / "index.html", "blog/index.html"),
-    ])
+    log.info("Публикую через git push (Cloudflare Pages автоматически задеплоит)...")
+    publish_via_git(article_path, slug, article["title"])
 
-    log.info(f"Статья опубликована: https://sevrugin.pro/blog/{slug}.html")
-    return f"https://sevrugin.pro/blog/{slug}.html"
+    url = f"https://sevrugin.pro/blog/{slug}.html"
+    log.info(f"Статья опубликована: {url} (Cloudflare задеплоит за ~1 мин)")
+    return url

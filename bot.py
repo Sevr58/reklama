@@ -629,7 +629,8 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             blog_url = await asyncio.get_running_loop().run_in_executor(None, lambda: publish_to_blog(final_text))
             results["Блог"] = ("✅", blog_url)
         except Exception as e:
-            results["Блог"] = ("❌", str(e))
+            log.error(f"[step:Блог] {e}", exc_info=True)
+            results["Блог"] = ("❌", str(e)[:120])
         await status_msg.edit_text(_build_progress(results))
 
         for media_file in filter(None, [preview_image, preview_video]):

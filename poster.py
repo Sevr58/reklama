@@ -7,8 +7,40 @@ log = logging.getLogger(__name__)
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
-def post_telegram(text: str, image_path: str = None):
+def post_telegram(text: str, image_path: str = None, video_path: str = None):
     """Публикует пост в Telegram-канал через прямой HTTP-запрос (без asyncio)."""
+    # Видео приоритетнее картинки
+    if video_path:
+        try:
+            with open(video_path, "rb") as vid:
+                if len(text) <= 1024:
+                    r = requests.post(
+                        f"{TG_API}/sendVideo",
+                        data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": text, "parse_mode": "HTML"},
+                        files={"video": vid},
+                        timeout=60,
+                    )
+                else:
+                    r = requests.post(
+                        f"{TG_API}/sendVideo",
+                        data={"chat_id": TELEGRAM_CHANNEL_ID},
+                        files={"video": vid},
+                        timeout=60,
+                    )
+                    r.raise_for_status()
+                    requests.post(
+                        f"{TG_API}/sendMessage",
+                        json={"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"},
+                        timeout=30,
+                    ).raise_for_status()
+                    log.info(f"[Telegram] Опубликовано с видео: {text[:60]}...")
+                    return
+            r.raise_for_status()
+            log.info(f"[Telegram] Опубликовано с видео: {text[:60]}...")
+            return
+        except FileNotFoundError:
+            log.warning(f"[Telegram] Видеофайл не найден: {video_path}, пробую без видео")
+
     if image_path:
         try:
             with open(image_path, "rb") as photo:
@@ -38,19 +70,17 @@ def post_telegram(text: str, image_path: str = None):
             log.warning(f"[Telegram] Файл не найден: {image_path}, публикую без фото")
             image_path = None
 
-    if not image_path:
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"},
-            timeout=30,
-        )
-
+    r = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"},
+        timeout=30,
+    )
     r.raise_for_status()
     log.info(f"[Telegram] Опубликовано: {text[:60]}...")
 
 
-def post_social(text: str, image_path: str = None, platforms: list = None):
-    """Публикует текст + картинку в указанные платформы через upload-post.com."""
+def post_social(text: str, image_path: str = None, video_path: str = None, platforms: list = None):
+    """Публикует текст + картинку или видео в указанные платформы через upload-post.com."""
     if not UPLOAD_POST_TOKEN or not UPLOAD_POST_USERNAME:
         log.warning("[Social] UPLOAD_POST_TOKEN или USERNAME не заданы — пропускаю")
         return
@@ -65,31 +95,47 @@ def post_social(text: str, image_path: str = None, platforms: list = None):
     for p in platforms:
         data["platform[]"] = p
 
-    if image_path:
+    # Видео приоритетнее картинки
+    if video_path:
         try:
-            with open(image_path, "rb") as img:
+            with open(video_path, "rb") as vid:
                 r = requests.post(
-                    "https://api.upload-post.com/api/upload_photos",
+                    "https://api.upload-post.com/api/upload",
                     headers=headers,
-                    files={"photos[]": img},
+                    files={"video": vid},
+                    data=data,
+                    timeout=120,
+                )
+        except FileNotFoundError:
+            log.warning(f"[Social] Видеофайл не найден: {video_path}, публикую без видео")
+            video_path = None
+
+    if not video_path:
+        if image_path:
+            try:
+                with open(image_path, "rb") as img:
+                    r = requests.post(
+                        "https://api.upload-post.com/api/upload_photos",
+                        headers=headers,
+                        files={"photos[]": img},
+                        data=data,
+                        timeout=60,
+                    )
+            except FileNotFoundError:
+                log.warning(f"[Social] Файл не найден: {image_path}, публикую без фото")
+                r = requests.post(
+                    "https://api.upload-post.com/api/upload_text",
+                    headers=headers,
                     data=data,
                     timeout=60,
                 )
-        except FileNotFoundError:
-            log.warning(f"[Social] Файл не найден: {image_path}, публикую без фото")
+        else:
             r = requests.post(
                 "https://api.upload-post.com/api/upload_text",
                 headers=headers,
                 data=data,
                 timeout=60,
             )
-    else:
-        r = requests.post(
-            "https://api.upload-post.com/api/upload_text",
-            headers=headers,
-            data=data,
-            timeout=60,
-        )
 
     log.info(f"[Social] {platforms} HTTP {r.status_code}: {r.text[:200]}")
     if r.status_code != 200:
