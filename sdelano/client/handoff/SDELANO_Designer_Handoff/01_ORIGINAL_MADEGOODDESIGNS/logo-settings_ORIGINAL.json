@@ -1,0 +1,46 @@
+{
+  "v": 1,
+  "name": "Сделано",
+  "tagline": "Позвонили. Приехали. Сделано!",
+  "layout": "side",
+  "style": "tech",
+  "font": {
+    "k": "russo-one",
+    "w": 400
+  },
+  "tfont": {
+    "k": "dm-sans",
+    "w": 700
+  },
+  "case": "upper",
+  "ls": 0.04,
+  "tcase": "upper",
+  "tls": 0.14,
+  "mark": {
+    "kind": "mono",
+    "shape": "rounded",
+    "stroke": 2,
+    "mono": "A",
+    "monoFont": {
+      "k": "russo-one",
+      "w": 400
+    },
+    "id": ""
+  },
+  "colors": {
+    "mark": "#4d7c0f",
+    "accent": "#b45309",
+    "text": "#1a240a",
+    "tag": "#1a240a",
+    "bg": null,
+    "on": "#ffffff",
+    "paper": "#fbfbf2"
+  },
+  "markScale": 1,
+  "gap": 1,
+  "decor": "none",
+  "divider": false,
+  "id": "c9",
+  "emblemFill": false,
+  "boxFill": false
+}
